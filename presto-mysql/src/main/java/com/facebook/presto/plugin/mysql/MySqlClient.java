@@ -17,11 +17,18 @@ import com.facebook.presto.plugin.jdbc.BaseJdbcClient;
 import com.facebook.presto.plugin.jdbc.BaseJdbcConfig;
 import com.facebook.presto.plugin.jdbc.ConnectionFactory;
 import com.facebook.presto.plugin.jdbc.DriverConnectionFactory;
+import com.facebook.presto.plugin.jdbc.JdbcColumnHandle;
 import com.facebook.presto.plugin.jdbc.JdbcConnectorId;
+import com.facebook.presto.plugin.jdbc.JdbcTableHandle;
+import com.facebook.presto.plugin.jdbc.JdbcTypeHandle;
+import com.facebook.presto.plugin.jdbc.ReadMapping;
+import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.SchemaTableName;
+import com.facebook.presto.spi.TableNotFoundException;
 import com.facebook.presto.spi.type.Type;
 import com.facebook.presto.spi.type.VarcharType;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.mysql.jdbc.Driver;
 import com.mysql.jdbc.Statement;
@@ -33,10 +40,15 @@ import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Types;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 
 import static com.facebook.presto.plugin.jdbc.DriverConnectionFactory.basicConnectionProperties;
+import static com.facebook.presto.plugin.jdbc.JdbcErrorCode.JDBC_ERROR;
 import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
 import static com.facebook.presto.spi.type.RealType.REAL;
 import static com.facebook.presto.spi.type.TimeWithTimeZoneType.TIME_WITH_TIME_ZONE;
@@ -175,5 +187,65 @@ public class MySqlClient
         }
 
         return super.toSqlType(type);
+    }
+
+    @Override
+    public List<JdbcColumnHandle> getColumns(ConnectorSession session, JdbcTableHandle tableHandle)
+    {
+        try (Connection connection = connectionFactory.openConnection()) {
+            try (ResultSet resultSet = getColumns(tableHandle, connection.getMetaData())) {
+                List<JdbcColumnHandle> columns = new ArrayList<>();
+                while (resultSet.next()) {
+                    int dataType = resultSet.getInt("DATA_TYPE");
+                    String typeName = resultSet.getString("TYPE_NAME");
+                    if (typeName != null && typeName.contains("UNSIGNED")) {
+                        switch (dataType) {
+                            case Types.TINYINT:
+                                dataType = Types.SMALLINT;
+                                break;
+                            case Types.SMALLINT:
+                                dataType = Types.INTEGER;
+                                break;
+                            case Types.INTEGER:
+                                dataType = Types.BIGINT;
+                                break;
+                            case Types.BIGINT:
+                                dataType = Types.DECIMAL;
+                                break;
+                            default:
+                        }
+                    }
+                    JdbcTypeHandle typeHandle = new JdbcTypeHandle(
+                            dataType,
+                            resultSet.getInt("COLUMN_SIZE"),
+                            resultSet.getInt("DECIMAL_DIGITS"));
+                    Optional<ReadMapping> columnMapping = toPrestoType(session, typeHandle);
+                    // skip unsupported column types
+                    if (columnMapping.isPresent()) {
+                        String columnName = resultSet.getString("COLUMN_NAME");
+                        columns.add(new JdbcColumnHandle(connectorId, columnName, typeHandle, columnMapping.get().getType()));
+                    }
+                }
+                if (columns.isEmpty()) {
+                    // In rare cases (e.g. PostgreSQL) a table might have no columns.
+                    throw new TableNotFoundException(tableHandle.getSchemaTableName());
+                }
+                return ImmutableList.copyOf(columns);
+            }
+        }
+        catch (SQLException e) {
+            throw new PrestoException(JDBC_ERROR, e);
+        }
+    }
+
+    private static ResultSet getColumns(JdbcTableHandle tableHandle, DatabaseMetaData metadata)
+            throws SQLException
+    {
+        String escape = metadata.getSearchStringEscape();
+        return metadata.getColumns(
+                tableHandle.getCatalogName(),
+                escapeNamePattern(tableHandle.getSchemaName(), escape),
+                escapeNamePattern(tableHandle.getTableName(), escape),
+                null);
     }
 }
